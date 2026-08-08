@@ -16,6 +16,7 @@ import collections
 import copy
 import gc
 import json
+import math
 import pathlib
 from unittest.mock import MagicMock, patch
 
@@ -26,17 +27,25 @@ import transformers
 from accelerate.utils.memory import release_memory
 from datasets import Dataset, DatasetDict, IterableDatasetDict, load_dataset
 from packaging.version import Version
+from tokenizers import Tokenizer
+from tokenizers.models import WordLevel
+from tokenizers.pre_tokenizers import Whitespace
 from transformers import (
     AutoModelForCausalLM,
     AutoModelForImageTextToText,
     AutoTokenizer,
     BitsAndBytesConfig,
+    PreTrainedTokenizerFast,
+    Qwen2Config,
+    Qwen2ForCausalLM,
     TrainingArguments,
 )
 from transformers.testing_utils import backend_empty_cache, torch_device
+from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import is_peft_available
 
 from trl import SFTConfig, SFTTrainer
+from trl.import_utils import is_torchao_available
 from trl.trainer.sft_trainer import (
     DataCollatorForLanguageModeling,
     _chunked_cross_entropy_loss,
@@ -54,6 +63,7 @@ from .testing_utils import (
     require_peft,
     require_torch_accelerator,
     require_torch_multi_accelerator,
+    require_torchao,
     require_vision,
 )
 
@@ -68,6 +78,86 @@ if is_peft_available():
         PromptTuningConfig,
         TaskType,
         get_peft_model,
+    )
+
+if is_torchao_available():
+    from torchao.quantization.qat import FakeQuantizedLinear
+
+
+def _get_tiny_torchao_qat_components(hidden_size: int = 128, dtype: torch.dtype = torch.bfloat16):
+    vocabulary = {
+        "[PAD]": 0,
+        "[UNK]": 1,
+        "[BOS]": 2,
+        "[EOS]": 3,
+        "hello": 4,
+        "world": 5,
+        "quantization": 6,
+        "aware": 7,
+        "training": 8,
+        "keeps": 9,
+        "weights": 10,
+        "trainable": 11,
+        "small": 12,
+        "model": 13,
+        "checkpoint": 14,
+        "resume": 15,
+    }
+    backend = Tokenizer(WordLevel(vocab=vocabulary, unk_token="[UNK]"))
+    backend.pre_tokenizer = Whitespace()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        bos_token="[BOS]",
+        eos_token="[EOS]",
+        unk_token="[UNK]",
+        pad_token="[PAD]",
+        model_max_length=64,
+    )
+    config = Qwen2Config(
+        vocab_size=len(tokenizer),
+        hidden_size=hidden_size,
+        intermediate_size=hidden_size * 2,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        max_position_embeddings=64,
+        bos_token_id=tokenizer.bos_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+        tie_word_embeddings=False,
+    )
+    model = Qwen2ForCausalLM(config).to(dtype=dtype)
+    dataset = Dataset.from_dict(
+        {
+            "text": [
+                "hello world",
+                "quantization aware training",
+                "training keeps weights trainable",
+                "small model checkpoint resume",
+            ]
+        }
+    )
+    return model, tokenizer, dataset
+
+
+def _get_torchao_qat_args(output_dir: str, max_steps: int = 1, save_steps: int = 500):
+    return SFTConfig(
+        output_dir=output_dir,
+        use_torchao_qat=True,
+        max_steps=max_steps,
+        per_device_train_batch_size=1,
+        gradient_checkpointing=False,
+        use_cpu=True,
+        bf16=False,
+        fp16=False,
+        loss_type="nll",
+        max_length=16,
+        learning_rate=1e-3,
+        logging_steps=1,
+        save_strategy="steps",
+        save_steps=save_steps,
+        report_to="none",
+        disable_tqdm=True,
     )
 
 
@@ -2226,6 +2316,180 @@ class TestSFTTrainer(TrlTestCase):
                 assert not torch.equal(param, new_param), f"Parameter {n} has not changed."
             else:
                 raise ValueError(f"Unexpected parameter {n} in model: {trainer.model}")
+
+
+class TestSFTTrainerTorchAO(TrlTestCase):
+    def test_torchao_is_not_required_when_qat_is_disabled(self):
+        model, tokenizer, dataset = _get_tiny_torchao_qat_components(hidden_size=32, dtype=torch.float32)
+        training_args = SFTConfig(
+            output_dir=self.tmp_dir,
+            max_steps=1,
+            gradient_checkpointing=False,
+            use_cpu=True,
+            bf16=False,
+            loss_type="nll",
+            report_to="none",
+        )
+
+        with patch("trl.trainer.sft_trainer.is_torchao_available", return_value=False):
+            trainer = SFTTrainer(
+                model=model,
+                args=training_args,
+                train_dataset=dataset,
+                processing_class=tokenizer,
+            )
+
+        assert trainer.args.use_torchao_qat is False
+        assert all(module.__class__.__name__ != "FakeQuantizedLinear" for module in trainer.model.modules())
+
+    def test_torchao_missing(self):
+        model, tokenizer, dataset = _get_tiny_torchao_qat_components()
+        training_args = _get_torchao_qat_args(self.tmp_dir)
+
+        with (
+            patch("trl.trainer.sft_trainer.is_torchao_available", return_value=False),
+            pytest.raises(ImportError, match=r'pip install "trl\[torchao\]"'),
+        ):
+            SFTTrainer(
+                model=model,
+                args=training_args,
+                train_dataset=dataset,
+                processing_class=tokenizer,
+            )
+
+    @require_peft
+    def test_torchao_with_qlora_raises(self):
+        model, tokenizer, dataset = _get_tiny_torchao_qat_components()
+        training_args = _get_torchao_qat_args(self.tmp_dir)
+
+        with pytest.raises(ValueError, match="does not support PEFT or QLoRA"):
+            SFTTrainer(
+                model=model,
+                args=training_args,
+                train_dataset=dataset,
+                processing_class=tokenizer,
+                peft_config=LoraConfig(),
+                quantization_config=BitsAndBytesConfig(load_in_4bit=True),
+            )
+
+    def test_torchao_with_quantization_config_raises(self):
+        model, tokenizer, dataset = _get_tiny_torchao_qat_components()
+        training_args = _get_torchao_qat_args(self.tmp_dir)
+
+        with pytest.raises(ValueError, match="does not support QLoRA or already quantized models"):
+            SFTTrainer(
+                model=model,
+                args=training_args,
+                train_dataset=dataset,
+                processing_class=tokenizer,
+                quantization_config=BitsAndBytesConfig(load_in_4bit=True),
+            )
+
+    @require_torchao
+    def test_torchao_requires_bfloat16(self):
+        model, tokenizer, dataset = _get_tiny_torchao_qat_components(dtype=torch.float32)
+        training_args = _get_torchao_qat_args(self.tmp_dir)
+
+        with pytest.raises(ValueError, match="requires all linear weights to use `torch.bfloat16`"):
+            SFTTrainer(
+                model=model,
+                args=training_args,
+                train_dataset=dataset,
+                processing_class=tokenizer,
+            )
+
+    @require_torchao
+    def test_torchao_requires_compatible_linear_dimensions(self):
+        model, tokenizer, dataset = _get_tiny_torchao_qat_components(hidden_size=32)
+        training_args = _get_torchao_qat_args(self.tmp_dir)
+
+        with pytest.raises(ValueError, match=r"divisible by the group size \(128\)"):
+            SFTTrainer(
+                model=model,
+                args=training_args,
+                train_dataset=dataset,
+                processing_class=tokenizer,
+            )
+
+    @require_torchao
+    def test_torchao_prepares_model_loaded_from_path(self):
+        model, tokenizer, dataset = _get_tiny_torchao_qat_components(dtype=torch.float32)
+        model_path = pathlib.Path(self.tmp_dir) / "model"
+        model.save_pretrained(model_path)
+        training_args = _get_torchao_qat_args(self.tmp_dir)
+        training_args.model_init_kwargs = {"dtype": torch.bfloat16}
+
+        trainer = SFTTrainer(
+            model=str(model_path),
+            args=training_args,
+            train_dataset=dataset,
+            processing_class=tokenizer,
+        )
+
+        assert any(isinstance(module, FakeQuantizedLinear) for module in trainer.model.modules())
+
+    @require_torchao
+    def test_torchao_prepare_forward_backward_and_train(self):
+        model, tokenizer, dataset = _get_tiny_torchao_qat_components()
+        training_args = _get_torchao_qat_args(self.tmp_dir)
+        trainer = SFTTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=dataset,
+            processing_class=tokenizer,
+        )
+
+        assert any(isinstance(module, FakeQuantizedLinear) for module in trainer.model.modules())
+        assert all(parameter.is_floating_point() for parameter in trainer.model.parameters())
+        assert all(parameter.requires_grad for parameter in trainer.model.parameters())
+
+        batch = trainer.data_collator([trainer.train_dataset[0]])
+        loss = trainer.model(**batch).loss
+        assert torch.isfinite(loss)
+        loss.backward()
+        gradients = [parameter.grad for parameter in trainer.model.parameters() if parameter.grad is not None]
+        assert gradients
+        assert all(torch.isfinite(gradient).all() for gradient in gradients)
+
+        parameter_name, parameter = next(
+            (name, parameter)
+            for name, parameter in trainer.model.named_parameters()
+            if parameter.grad is not None and parameter.grad.abs().sum() > 0
+        )
+        parameter_before = parameter.detach().clone()
+        trainer.model.zero_grad()
+        result = trainer.train()
+
+        assert math.isfinite(result.training_loss)
+        assert not torch.equal(parameter_before, trainer.model.get_parameter(parameter_name))
+
+    @require_torchao
+    def test_torchao_checkpoint_resume(self):
+        model, tokenizer, dataset = _get_tiny_torchao_qat_components()
+        trainer = SFTTrainer(
+            model=model,
+            args=_get_torchao_qat_args(self.tmp_dir, max_steps=1, save_steps=1),
+            train_dataset=dataset,
+            processing_class=tokenizer,
+        )
+        first_result = trainer.train()
+        checkpoint = get_last_checkpoint(self.tmp_dir)
+
+        assert math.isfinite(first_result.training_loss)
+        assert checkpoint is not None
+
+        recreated_model, _, _ = _get_tiny_torchao_qat_components()
+        resumed_trainer = SFTTrainer(
+            model=recreated_model,
+            args=_get_torchao_qat_args(self.tmp_dir, max_steps=2, save_steps=1),
+            train_dataset=dataset,
+            processing_class=tokenizer,
+        )
+        resumed_result = resumed_trainer.train(resume_from_checkpoint=checkpoint)
+
+        assert resumed_trainer.state.global_step == 2
+        assert math.isfinite(resumed_result.training_loss)
+        assert any(isinstance(module, FakeQuantizedLinear) for module in resumed_trainer.model.modules())
 
 
 @pytest.mark.slow

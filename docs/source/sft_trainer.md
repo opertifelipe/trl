@@ -245,6 +245,45 @@ trainer.train()
 > SFTConfig(learning_rate=1e-4, ...)
 > ```
 
+### Train with TorchAO QAT
+
+[`SFTTrainer`] supports opt-in INT4 weight-only quantization-aware training (QAT) with TorchAO. Install the optional
+dependency first:
+
+```bash
+pip install "trl[torchao]"
+```
+
+Load the model in `bfloat16` and enable QAT in [`SFTConfig`]:
+
+```python
+import torch
+
+from datasets import load_dataset
+
+from trl import SFTConfig, SFTTrainer
+
+
+dataset = load_dataset("trl-lib/Capybara", split="train")
+training_args = SFTConfig(
+    use_torchao_qat=True,
+    model_init_kwargs={"dtype": torch.bfloat16},
+)
+trainer = SFTTrainer(
+    model="Qwen/Qwen3-0.6B",
+    args=training_args,
+    train_dataset=dataset,
+)
+trainer.train()
+```
+
+This first version supports full-parameter training only. Every linear layer input dimension must be divisible by the
+INT4 group size of 128. PEFT, LoRA, QLoRA, and already quantized models are not supported.
+
+QAT checkpoints retain floating-point trainable weights and are intended for training resume. Recreate the same base
+model with `use_torchao_qat=True` before loading a checkpoint. Converting or packing the trained model for INT4
+deployment is a separate TorchAO step and is not performed by [`SFTTrainer`].
+
 ### Train with Liger Kernel
 
 Liger Kernel is a collection of Triton kernels for LLM training that boosts multi-GPU throughput by 20%, cuts memory use by 60% (enabling up to 4× longer context), and works seamlessly with tools like FlashAttention, PyTorch FSDP, and DeepSpeed. For more information, see [Liger Kernel Integration](liger_kernel_integration).

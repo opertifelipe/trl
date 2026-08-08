@@ -41,6 +41,7 @@ from trl.import_utils import (
     is_math_verify_available,
     is_mergekit_available,
     is_openreward_available,
+    is_torchao_available,
     is_vllm_available,
 )
 
@@ -64,6 +65,7 @@ require_rich = pytest.mark.skipif(not is_rich_available(), reason="test requires
 require_sklearn = pytest.mark.skipif(
     not (is_sklearn_available() and is_joblib_available()), reason="test requires sklearn"
 )
+require_torchao = pytest.mark.skipif(not is_torchao_available(), reason="test requires torchao")
 require_torch_accelerator = pytest.mark.skipif(
     torch_device is None or torch_device == "cpu", reason="test requires accelerator"
 )

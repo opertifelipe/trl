@@ -79,6 +79,9 @@ test = [
     "pytest-xdist",
     "pytest"
 ]
+torchao = [
+    "torchao>=0.17.0"
+]
 vllm = [
     "vllm>=0.17.0,<=0.26.0",
     "fastapi",
