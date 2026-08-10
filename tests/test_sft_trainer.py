@@ -81,7 +81,8 @@ if is_peft_available():
     )
 
 if is_torchao_available():
-    from torchao.quantization.qat import FakeQuantizedLinear
+    from torchao.quantization import Int4TilePackedTo4dTensor, Int4WeightOnlyConfig, quantize_
+    from torchao.quantization.qat import FakeQuantizedLinear, QATConfig
 
 
 def _get_tiny_torchao_qat_components(hidden_size: int = 128, dtype: torch.dtype = torch.bfloat16):
@@ -2320,6 +2321,7 @@ class TestSFTTrainer(TrlTestCase):
 
 class TestSFTTrainerTorchAO(TrlTestCase):
     def test_torchao_is_not_required_when_qat_is_disabled(self):
+        """TorchAO remains optional when QAT is disabled."""
         model, tokenizer, dataset = _get_tiny_torchao_qat_components(hidden_size=32, dtype=torch.float32)
         training_args = SFTConfig(
             output_dir=self.tmp_dir,
@@ -2343,6 +2345,7 @@ class TestSFTTrainerTorchAO(TrlTestCase):
         assert all(module.__class__.__name__ != "FakeQuantizedLinear" for module in trainer.model.modules())
 
     def test_torchao_missing(self):
+        """Enabling QAT without TorchAO raises an actionable installation error."""
         model, tokenizer, dataset = _get_tiny_torchao_qat_components()
         training_args = _get_torchao_qat_args(self.tmp_dir)
 
@@ -2359,6 +2362,7 @@ class TestSFTTrainerTorchAO(TrlTestCase):
 
     @require_peft
     def test_torchao_with_qlora_raises(self):
+        """TorchAO QAT rejects the unsupported PEFT and QLoRA combination."""
         model, tokenizer, dataset = _get_tiny_torchao_qat_components()
         training_args = _get_torchao_qat_args(self.tmp_dir)
 
@@ -2373,6 +2377,7 @@ class TestSFTTrainerTorchAO(TrlTestCase):
             )
 
     def test_torchao_with_quantization_config_raises(self):
+        """TorchAO QAT rejects models requested with a quantization config."""
         model, tokenizer, dataset = _get_tiny_torchao_qat_components()
         training_args = _get_torchao_qat_args(self.tmp_dir)
 
@@ -2387,6 +2392,7 @@ class TestSFTTrainerTorchAO(TrlTestCase):
 
     @require_torchao
     def test_torchao_requires_bfloat16(self):
+        """TorchAO QAT rejects linear weights that are not `bfloat16`."""
         model, tokenizer, dataset = _get_tiny_torchao_qat_components(dtype=torch.float32)
         training_args = _get_torchao_qat_args(self.tmp_dir)
 
@@ -2400,6 +2406,7 @@ class TestSFTTrainerTorchAO(TrlTestCase):
 
     @require_torchao
     def test_torchao_requires_compatible_linear_dimensions(self):
+        """TorchAO QAT rejects linear input dimensions incompatible with the group size of 128."""
         model, tokenizer, dataset = _get_tiny_torchao_qat_components(hidden_size=32)
         training_args = _get_torchao_qat_args(self.tmp_dir)
 
@@ -2413,6 +2420,7 @@ class TestSFTTrainerTorchAO(TrlTestCase):
 
     @require_torchao
     def test_torchao_prepares_model_loaded_from_path(self):
+        """A model loaded from a local path is converted to BF16 and prepared for QAT."""
         model, tokenizer, dataset = _get_tiny_torchao_qat_components(dtype=torch.float32)
         model_path = pathlib.Path(self.tmp_dir) / "model"
         model.save_pretrained(model_path)
@@ -2430,6 +2438,7 @@ class TestSFTTrainerTorchAO(TrlTestCase):
 
     @require_torchao
     def test_torchao_prepare_forward_backward_and_train(self):
+        """QAT preserves trainable floating-point weights and supports a complete training step."""
         model, tokenizer, dataset = _get_tiny_torchao_qat_components()
         training_args = _get_torchao_qat_args(self.tmp_dir)
         trainer = SFTTrainer(
@@ -2463,8 +2472,46 @@ class TestSFTTrainerTorchAO(TrlTestCase):
         assert math.isfinite(result.training_loss)
         assert not torch.equal(parameter_before, trainer.model.get_parameter(parameter_name))
 
+    @pytest.mark.skipif(not is_ampere_or_newer(), reason="test requires an NVIDIA Ampere or newer GPU")
+    @require_torchao
+    def test_torchao_convert_to_int4_for_inference(self):
+        """A trained QAT model converts to tile-packed INT4 and runs inference."""
+        model, tokenizer, dataset = _get_tiny_torchao_qat_components()
+        trainer = SFTTrainer(
+            model=model,
+            args=_get_torchao_qat_args(self.tmp_dir),
+            train_dataset=dataset,
+            processing_class=tokenizer,
+        )
+        trainer.train()
+
+        model = trainer.accelerator.unwrap_model(trainer.model).to("cuda")
+        model.eval()
+        inference_config = Int4WeightOnlyConfig(
+            group_size=128,
+            int4_packing_format="tile_packed_to_4d",
+            int4_choose_qparams_algorithm="hqq",
+        )
+        quantize_(model, QATConfig(inference_config, step="convert"))
+
+        assert not any(isinstance(module, FakeQuantizedLinear) for module in model.modules())
+        assert any(
+            isinstance(module.weight, Int4TilePackedTo4dTensor)
+            for module in model.modules()
+            if isinstance(module, torch.nn.Linear)
+        )
+
+        batch = trainer.data_collator([trainer.train_dataset[0]])
+        batch = {name: value.to("cuda") if isinstance(value, torch.Tensor) else value for name, value in batch.items()}
+        with torch.inference_mode():
+            outputs = model(**batch)
+
+        assert torch.isfinite(outputs.loss)
+        assert torch.isfinite(outputs.logits).all()
+
     @require_torchao
     def test_torchao_checkpoint_resume(self):
+        """A QAT checkpoint resumes after recreating the prepared model topology."""
         model, tokenizer, dataset = _get_tiny_torchao_qat_components()
         trainer = SFTTrainer(
             model=model,

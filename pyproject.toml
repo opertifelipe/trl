@@ -131,6 +131,8 @@ dev = [
     "pytest-rerunfailures==15.1",
     "pytest-xdist",
     "pytest",
+    # torchao
+    "torchao>=0.17.0",
     # vllm: not included in dev by default due to CUDA error; see GH-4228
     # vlm
     "Pillow",

@@ -277,6 +277,50 @@ trainer = SFTTrainer(
 trainer.train()
 ```
 
+After training, unwrap the model and pass the deployment configuration to `QATConfig` to convert the QAT modules and
+run INT4 inference:
+
+```python
+import torch
+
+from torchao.quantization import Int4WeightOnlyConfig, quantize_
+from torchao.quantization.qat import QATConfig
+
+
+model = trainer.accelerator.unwrap_model(trainer.model)
+model.eval()
+
+inference_config = Int4WeightOnlyConfig(
+    group_size=128,
+    int4_packing_format="tile_packed_to_4d",
+    int4_choose_qparams_algorithm="hqq",
+)
+quantize_(model, QATConfig(inference_config, step="convert"))
+
+messages = [{"role": "user", "content": "What is the capital of France?"}]
+inputs = trainer.processing_class.apply_chat_template(
+    messages,
+    add_generation_prompt=True,
+    tokenize=True,
+    return_dict=True,
+    return_tensors="pt",
+).to(model.device)
+
+with torch.inference_mode():
+    output_ids = model.generate(**inputs, max_new_tokens=64)
+
+prompt_length = inputs["input_ids"].shape[1]
+completion = trainer.processing_class.decode(output_ids[0, prompt_length:], skip_special_tokens=True)
+print(completion)
+```
+
+Passing `inference_config` as the base configuration of `QATConfig` makes the convert step first replace
+`FakeQuantizedLinear` modules with regular linear modules and then immediately quantize their weights. This is
+equivalent to calling `quantize_(model, QATConfig(step="convert"))` followed by
+`quantize_(model, inference_config)` when the same modules and inference configuration are used. The group size of 128
+matches the fake quantization used during training. A different deployment group size, such as 32, is supported by the
+INT4 configuration, but it no longer exactly matches the quantization simulated during QAT.
+
 This first version supports full-parameter training only. Every linear layer input dimension must be divisible by the
 INT4 group size of 128. PEFT, LoRA, QLoRA, and already quantized models are not supported.
 
