@@ -290,11 +290,7 @@ from torchao.quantization.qat import QATConfig
 model = trainer.accelerator.unwrap_model(trainer.model)
 model.eval()
 
-inference_config = Int4WeightOnlyConfig(
-    group_size=128,
-    int4_packing_format="tile_packed_to_4d",
-    int4_choose_qparams_algorithm="hqq",
-)
+inference_config = Int4WeightOnlyConfig(group_size=128)
 quantize_(model, QATConfig(inference_config, step="convert"))
 
 messages = [{"role": "user", "content": "What is the capital of France?"}]
@@ -313,6 +309,25 @@ prompt_length = inputs["input_ids"].shape[1]
 completion = trainer.processing_class.decode(output_ids[0, prompt_length:], skip_special_tokens=True)
 print(completion)
 ```
+
+The available INT4 inference path depends on the hardware, the PyTorch and TorchAO builds, and the backend kernels. On
+machines that support the default `plain` packing format and `tinygemm` qparams algorithm, the configuration above is
+sufficient. Some CUDA setups instead require a tile-packed layout and HQQ qparams. If conversion or the first inference
+fails because the default layout or kernel is unsupported, use:
+
+```python
+inference_config = Int4WeightOnlyConfig(
+    group_size=128,
+    int4_packing_format="tile_packed_to_4d",
+    int4_choose_qparams_algorithm="hqq",
+)
+quantize_(model, QATConfig(inference_config, step="convert"))
+```
+
+TorchAO supports the `hqq` qparams algorithm with the `tile_packed_to_4d` format, so these two settings must be used
+together. Both configurations preserve the group size of 128 used during QAT, but they select different deployment
+packing and qparams paths. Validate conversion and inference on the target hardware before publishing the quantized
+artifact.
 
 Passing `inference_config` as the base configuration of `QATConfig` makes the convert step first replace
 `FakeQuantizedLinear` modules with regular linear modules and then immediately quantize their weights. This is
