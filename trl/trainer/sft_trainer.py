@@ -64,6 +64,7 @@ from ..data_utils import (
     pack_dataset,
     prepare_multimodal_messages,
 )
+from ..import_utils import is_torchao_available
 from ..models import get_act_offloading_ctx_manager
 from .base_trainer import _BaseTrainer
 from .sft_config import SFTConfig
@@ -84,6 +85,32 @@ if is_peft_available():
 
 
 _CHUNKED_LM_HEAD_CHUNK_SIZE = 256
+_TORCHAO_QAT_GROUP_SIZE = 128
+
+
+def _prepare_model_for_torchao_qat(model: PreTrainedModel) -> None:
+    from torchao.quantization import Int4WeightOnlyConfig, quantize_
+    from torchao.quantization.qat import FakeQuantizedLinear, QATConfig
+
+    if any(isinstance(module, FakeQuantizedLinear) for module in model.modules()):
+        raise ValueError("The model is already prepared for TorchAO QAT.")
+
+    linear_modules = [module for module in model.modules() if isinstance(module, nn.Linear)]
+    if not linear_modules:
+        raise ValueError("TorchAO QAT requires the model to contain at least one `torch.nn.Linear` module.")
+    if any(module.weight.dtype != torch.bfloat16 for module in linear_modules):
+        raise ValueError("TorchAO INT4 weight-only QAT requires all linear weights to use `torch.bfloat16`.")
+    if any(module.in_features % _TORCHAO_QAT_GROUP_SIZE != 0 for module in linear_modules):
+        raise ValueError(
+            "TorchAO INT4 weight-only QAT requires every linear layer input dimension to be divisible by the group "
+            f"size ({_TORCHAO_QAT_GROUP_SIZE})."
+        )
+
+    base_config = Int4WeightOnlyConfig(group_size=_TORCHAO_QAT_GROUP_SIZE)
+    quantize_(model, QATConfig(base_config, step="prepare"))
+
+    if not any(isinstance(module, FakeQuantizedLinear) for module in model.modules()):
+        raise ValueError("TorchAO QAT did not prepare any linear modules.")
 
 
 @dataclass
@@ -933,6 +960,20 @@ class SFTTrainer(_BaseTrainer):
                 dict_args.pop("push_to_hub_token")
             args = SFTConfig(**dict_args)
 
+        if args.use_torchao_qat:
+            if peft_config is not None:
+                raise ValueError("TorchAO QAT does not support PEFT or QLoRA. Do not pass `peft_config`.")
+            if quantization_config is not None:
+                raise ValueError(
+                    "TorchAO QAT does not support QLoRA or already quantized models. Do not pass "
+                    "`quantization_config`; start from a `bfloat16` model."
+                )
+            if not is_torchao_available():
+                raise ImportError(
+                    "You set `use_torchao_qat=True`, but the `torchao` library is not installed. Install it with "
+                    '`pip install "trl[torchao]"`.'
+                )
+
         if train_dataset is None:
             raise ValueError("`train_dataset` is required")
         elif isinstance(train_dataset, IterableDataset):
@@ -953,6 +994,11 @@ class SFTTrainer(_BaseTrainer):
         # Model
         if isinstance(model, str):
             model_init_kwargs = dict(args.model_init_kwargs or {})  # copy to avoid mutating model_init_kwargs
+            if args.use_torchao_qat and "quantization_config" in model_init_kwargs:
+                raise ValueError(
+                    "TorchAO QAT does not support QLoRA or already quantized models. Remove `quantization_config` "
+                    "from `model_init_kwargs` and start from a `bfloat16` model."
+                )
             if quantization_config is not None:
                 if "quantization_config" in model_init_kwargs:
                     raise ValueError(
@@ -978,6 +1024,13 @@ class SFTTrainer(_BaseTrainer):
                 )
         # Non-quantized models do not have the `is_loaded_in_{8,4}bit` attributes, whereas quantized models do
         _is_quantized_model = getattr(model, "is_loaded_in_4bit", False) or getattr(model, "is_loaded_in_8bit", False)
+        if args.use_torchao_qat:
+            if is_peft_model(model):
+                raise ValueError("TorchAO QAT does not support PEFT or QLoRA models.")
+            if _is_quantized_model or model.config.to_dict().get("quantization_config") is not None:
+                raise ValueError(
+                    "TorchAO QAT does not support QLoRA or already quantized models. Start from a `bfloat16` model."
+                )
 
         # Processing class
         if processing_class is None:
@@ -1046,6 +1099,10 @@ class SFTTrainer(_BaseTrainer):
                 "drop them, causing pixel_values to be forwarded to the model with no corresponding visual "
                 "tokens in input_ids. Use truncation_mode='keep_start' (the default) or set max_length=None."
             )
+
+        # QAT preparation changes the module topology, so it must happen before Trainer/Accelerate wrap the model.
+        if args.use_torchao_qat:
+            _prepare_model_for_torchao_qat(model)
 
         # PEFT
         if peft_config is not None:

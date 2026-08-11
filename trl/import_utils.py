@@ -102,6 +102,10 @@ def is_requests_available() -> bool:
     return _is_package_available("requests")
 
 
+def is_torchao_available() -> bool:
+    return _is_package_available("torchao")
+
+
 def is_unsloth_available() -> bool:
     return _is_package_available("unsloth")
 

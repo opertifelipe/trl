@@ -39,6 +39,10 @@ class SFTConfig(_BaseConfig):
         model_init_kwargs (`dict[str, Any]`, *optional*):
             Keyword arguments for [`~transformers.AutoModelForCausalLM.from_pretrained`], used when the `model`
             argument of the [`SFTTrainer`] is provided as a string.
+        use_torchao_qat (`bool`, *optional*, defaults to `False`):
+            Whether to enable TorchAO INT4 weight-only quantization-aware training. This requires a `bfloat16` model
+            whose linear layer input dimensions are divisible by 128. PEFT, QLoRA, and already quantized models are
+            not supported.
         trust_remote_code (`bool`, *optional*, defaults to `False`):
             Whether to allow loading models and tokenizers that ship custom Python code from the Hub. Forwarded to
             [`~transformers.AutoModelForCausalLM.from_pretrained`] and
@@ -151,6 +155,14 @@ class SFTConfig(_BaseConfig):
         metadata={
             "help": "Keyword arguments for `AutoModelForCausalLM.from_pretrained`, used when the `model` argument of "
             "the `SFTTrainer` is provided as a string."
+        },
+    )
+    use_torchao_qat: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to enable TorchAO INT4 weight-only quantization-aware training. This requires a "
+            "bfloat16 model whose linear layer input dimensions are divisible by 128. PEFT, QLoRA, and already "
+            "quantized models are not supported."
         },
     )
     router_aux_loss_coef: float = field(

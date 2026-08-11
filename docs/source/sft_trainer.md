@@ -245,6 +245,104 @@ trainer.train()
 > SFTConfig(learning_rate=1e-4, ...)
 > ```
 
+### Train with TorchAO QAT
+
+[`SFTTrainer`] supports opt-in INT4 weight-only quantization-aware training (QAT) with TorchAO. Install the optional
+dependency first:
+
+```bash
+pip install "trl[torchao]"
+```
+
+Load the model in `bfloat16` and enable QAT in [`SFTConfig`]:
+
+```python
+import torch
+
+from datasets import load_dataset
+
+from trl import SFTConfig, SFTTrainer
+
+
+dataset = load_dataset("trl-lib/Capybara", split="train")
+training_args = SFTConfig(
+    use_torchao_qat=True,
+    model_init_kwargs={"dtype": torch.bfloat16},
+)
+trainer = SFTTrainer(
+    model="Qwen/Qwen3-0.6B",
+    args=training_args,
+    train_dataset=dataset,
+)
+trainer.train()
+```
+
+After training, unwrap the model and pass the deployment configuration to `QATConfig` to convert the QAT modules and
+run INT4 inference:
+
+```python
+import torch
+
+from torchao.quantization import Int4WeightOnlyConfig, quantize_
+from torchao.quantization.qat import QATConfig
+
+
+model = trainer.accelerator.unwrap_model(trainer.model)
+model.eval()
+
+inference_config = Int4WeightOnlyConfig(group_size=128)
+quantize_(model, QATConfig(inference_config, step="convert"))
+
+messages = [{"role": "user", "content": "What is the capital of France?"}]
+inputs = trainer.processing_class.apply_chat_template(
+    messages,
+    add_generation_prompt=True,
+    tokenize=True,
+    return_dict=True,
+    return_tensors="pt",
+).to(model.device)
+
+with torch.inference_mode():
+    output_ids = model.generate(**inputs, max_new_tokens=64)
+
+prompt_length = inputs["input_ids"].shape[1]
+completion = trainer.processing_class.decode(output_ids[0, prompt_length:], skip_special_tokens=True)
+print(completion)
+```
+
+The available INT4 inference path depends on the hardware, the PyTorch and TorchAO builds, and the backend kernels. On
+machines that support the default `plain` packing format and `tinygemm` qparams algorithm, the configuration above is
+sufficient. Some CUDA setups instead require a tile-packed layout and HQQ qparams. If conversion or the first inference
+fails because the default layout or kernel is unsupported, use:
+
+```python
+inference_config = Int4WeightOnlyConfig(
+    group_size=128,
+    int4_packing_format="tile_packed_to_4d",
+    int4_choose_qparams_algorithm="hqq",
+)
+quantize_(model, QATConfig(inference_config, step="convert"))
+```
+
+TorchAO supports the `hqq` qparams algorithm with the `tile_packed_to_4d` format, so these two settings must be used
+together. Both configurations preserve the group size of 128 used during QAT, but they select different deployment
+packing and qparams paths. Validate conversion and inference on the target hardware before publishing the quantized
+artifact.
+
+Passing `inference_config` as the base configuration of `QATConfig` makes the convert step first replace
+`FakeQuantizedLinear` modules with regular linear modules and then immediately quantize their weights. This is
+equivalent to calling `quantize_(model, QATConfig(step="convert"))` followed by
+`quantize_(model, inference_config)` when the same modules and inference configuration are used. The group size of 128
+matches the fake quantization used during training. A different deployment group size, such as 32, is supported by the
+INT4 configuration, but it no longer exactly matches the quantization simulated during QAT.
+
+This first version supports full-parameter training only. Every linear layer input dimension must be divisible by the
+INT4 group size of 128. PEFT, LoRA, QLoRA, and already quantized models are not supported.
+
+QAT checkpoints retain floating-point trainable weights and are intended for training resume. Recreate the same base
+model with `use_torchao_qat=True` before loading a checkpoint. Converting or packing the trained model for INT4
+deployment is a separate TorchAO step and is not performed by [`SFTTrainer`].
+
 ### Train with Liger Kernel
 
 Liger Kernel is a collection of Triton kernels for LLM training that boosts multi-GPU throughput by 20%, cuts memory use by 60% (enabling up to 4× longer context), and works seamlessly with tools like FlashAttention, PyTorch FSDP, and DeepSpeed. For more information, see [Liger Kernel Integration](liger_kernel_integration).
